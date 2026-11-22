@@ -1,0 +1,1096 @@
+
+.386
+.model flat, stdcall
+option casemap:none
+
+include \masm32\include\windows.inc
+include \masm32\include\kernel32.inc
+include \masm32\include\user32.inc
+include \masm32\include\gdi32.inc
+includelib \masm32\lib\kernel32.lib
+includelib \masm32\lib\user32.lib
+includelib \masm32\lib\gdi32.lib
+
+; ---------------------------------------------------------------- prototypes
+WinMain     PROTO :DWORD,:DWORD,:DWORD,:DWORD
+WndProc     PROTO :DWORD,:DWORD,:DWORD,:DWORD
+SetSlot     PROTO :DWORD,:DWORD,:DWORD
+SetX        PROTO :DWORD,:DWORD
+ValAt       PROTO :DWORD
+ResetCols   PROTO :DWORD
+SwapAnim    PROTO :DWORD,:DWORD
+PlaceMerged PROTO :DWORD,:DWORD,:DWORD
+SiftDown    PROTO :DWORD,:DWORD
+MSort       PROTO :DWORD,:DWORD,:DWORD
+StartSort   PROTO :DWORD
+Rand        PROTO :DWORD
+MakeBtn     PROTO :DWORD,:DWORD,:DWORD,:DWORD
+DrawScene   PROTO :DWORD
+
+; ----------------------------------------------------------------- constants
+MAXN    equ 12          ; max number of elements
+MAXEV   equ 1000        ; max recorded snapshots
+RECSZ   equ 144         ; one snapshot = 36 dwords (X[12],Y[12],Color[12])
+BOXW    equ 50
+BOXH    equ 50
+STEP    equ 64          ; horizontal distance between slots
+LEFTX   equ 80
+BASEY   equ 200
+ROWH    equ 70          ; vertical distance between merge-sort levels
+LIFT    equ 40          ; how far a box lifts when swapping
+DIVX    equ 10          ; merge sort split shift (pixels)
+
+ID_EDIT   equ 100
+ID_APPLY  equ 101
+ID_RANDOM equ 102
+ID_BUBBLE equ 103
+ID_HEAP   equ 104
+ID_INS    equ 105
+ID_MERGE  equ 106
+ID_SLOW   equ 107
+ID_FAST   equ 108
+
+; ------------------------------------------------------------------- macros
+; Move current coordinate array 'cur' one animation step toward 'dtg'
+MOVAXIS MACRO cur, dtg
+    LOCAL maSkip, maNeg, maSet
+    mov eax, dtg[ecx*4]
+    mov edx, eax
+    sub eax, cur[ecx*4]
+    jz maSkip
+    mov moved, 1
+    mov ebx, stepPx
+    cmp eax, ebx
+    jle maNeg
+    add cur[ecx*4], ebx
+    jmp maSkip
+maNeg:
+    neg ebx
+    cmp eax, ebx
+    jge maSet
+    add cur[ecx*4], ebx
+    jmp maSkip
+maSet:
+    mov cur[ecx*4], edx
+maSkip:
+ENDM
+
+; -------------------------------------------------------------------- data
+.data
+ClassName   db "SortVizClass",0
+AppName     db "Sorting Algorithms Visualizer (x86 MASM32)",0
+btnClass    db "BUTTON",0
+editClass   db "EDIT",0
+fontName    db "Segoe UI",0
+defText     db "64, 25, 12, 22, 11, 90, 5, 38",0
+sApply      db "Apply",0
+sRandom     db "Random",0
+sBubble     db "Bubble",0
+sHeap       db "Heap",0
+sIns        db "Insertion",0
+sMerge      db "Merge",0
+sSlow       db "Slower",0
+sFast       db "Faster",0
+fmtNum      db "%d",0
+fmtSpeed    db "Speed: %d / 6",0
+sepStr      db ", ",0
+msgBad      db "Please enter between 2 and 12 integers (up to 4 digits each), separated by commas or spaces.",0
+legendStr   db "Blue: unsorted    Orange: comparing    Red: moving / key    Green: sorted    Purple: merged",0
+
+tReady      db "Ready",0
+dReady      db "Type numbers (comma separated) and press Apply, or press Random. Then pick an algorithm.",0
+tBubbleT    db "Bubble Sort",0
+dBubbleT    db "Adjacent boxes are compared (orange) and swapped (red) if out of order. Largest values bubble to the end (green).",0
+tHeapT      db "Heap Sort",0
+dHeapT      db "Build a max-heap, then repeatedly swap the root with the last unsorted box and sift the new root down.",0
+tInsT       db "Insertion Sort",0
+dInsT       db "A key box is lifted (red), larger boxes shift right (orange), then the key drops into its place.",0
+tMergeT     db "Merge Sort",0
+dMergeT     db "The array is split into halves (boxes move down and apart); halves are then merged back up in sorted order.",0
+
+curTitle    dd offset tReady
+curDesc     dd offset dReady
+
+hInstance   dd 0
+hMain       dd 0
+hEdit       dd 0
+hFontTitle  dd 0
+hFontBox    dd 0
+hFontSmall  dd 0
+hBgBrush    dd 0
+hBr         dd 5 dup(0)
+
+nCount      dd 8
+vals        dd MAXN dup(0)     ; value shown in box b (never changes)
+ordr        dd MAXN dup(0)     ; ordr[pos] = box id sitting at array position pos
+tmpA        dd MAXN dup(0)
+xoff        dd MAXN dup(0)     ; merge-sort horizontal split offset of each slot
+
+; Logical targets (written by the sort procedures) - must stay contiguous
+tgX         dd MAXN dup(0)
+tgY         dd MAXN dup(0)
+tgC         dd MAXN dup(0)
+; Current (animated) display state - contiguous
+curX        dd MAXN dup(0)
+curY        dd MAXN dup(0)
+curC        dd MAXN dup(0)
+; Targets of the snapshot being played - contiguous
+dtgX        dd MAXN dup(0)
+dtgY        dd MAXN dup(0)
+dtgC        dd MAXN dup(0)
+
+evCount     dd 0
+evCur       dd 0
+playing     dd 0
+waitCnt     dd 0
+speedLvl    dd 3
+stepPx      dd 12
+delayTicks  dd 8
+seed        dd 12345
+
+dirtyRc     RECT <0,45,940,620>
+
+inBuf       db 256 dup(0)
+numBuf      db 32 dup(0)
+
+.data?
+snaps       dd MAXEV*36 dup(?)
+
+; --------------------------------------------------------------------- code
+.code
+start:
+    invoke GetModuleHandle, NULL
+    mov hInstance, eax
+    invoke WinMain, hInstance, NULL, NULL, SW_SHOWDEFAULT
+    invoke ExitProcess, eax
+
+; ============================================================= WinMain
+WinMain proc hInst:DWORD, hPrev:DWORD, CmdLine:DWORD, CmdShow:DWORD
+    LOCAL wc:WNDCLASSEX
+    LOCAL msg:MSG
+    LOCAL hwnd:DWORD
+
+    mov wc.cbSize, SIZEOF WNDCLASSEX
+    mov wc.style, CS_HREDRAW or CS_VREDRAW
+    mov wc.lpfnWndProc, offset WndProc
+    mov wc.cbClsExtra, NULL
+    mov wc.cbWndExtra, NULL
+    push hInst
+    pop wc.hInstance
+    mov wc.hbrBackground, COLOR_WINDOW+1
+    mov wc.lpszMenuName, NULL
+    mov wc.lpszClassName, offset ClassName
+    invoke LoadIcon, NULL, IDI_APPLICATION
+    mov wc.hIcon, eax
+    mov wc.hIconSm, eax
+    invoke LoadCursor, NULL, IDC_ARROW
+    mov wc.hCursor, eax
+    invoke RegisterClassEx, addr wc
+
+    invoke CreateWindowEx, NULL, addr ClassName, addr AppName, \
+           WS_OVERLAPPED or WS_CAPTION or WS_SYSMENU or WS_MINIMIZEBOX or WS_CLIPCHILDREN or WS_VISIBLE, \
+           CW_USEDEFAULT, CW_USEDEFAULT, 940, 620, NULL, NULL, hInst, NULL
+    mov hwnd, eax
+    invoke ShowWindow, hwnd, SW_SHOWNORMAL
+    invoke UpdateWindow, hwnd
+
+msgLoop:
+    invoke GetMessage, addr msg, NULL, 0, 0
+    cmp eax, 0
+    je msgEnd
+    invoke TranslateMessage, addr msg
+    invoke DispatchMessage, addr msg
+    jmp msgLoop
+msgEnd:
+    mov eax, msg.wParam
+    ret
+WinMain endp
+
+; ============================================================= WndProc
+WndProc proc hWnd:DWORD, uMsg:DWORD, wParam:DWORD, lParam:DWORD
+    LOCAL ps:PAINTSTRUCT
+    LOCAL rc:RECT
+    LOCAL hdc:DWORD
+    LOCAL memDC:DWORD
+    LOCAL hbm:DWORD
+    LOCAL oldbm:DWORD
+
+    .if uMsg==WM_CREATE
+        mov eax, hWnd
+        mov hMain, eax
+        invoke GetTickCount
+        mov seed, eax
+
+        invoke CreateFont, 26,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH or FF_DONTCARE,offset fontName
+        mov hFontTitle, eax
+        invoke CreateFont, 24,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH or FF_DONTCARE,offset fontName
+        mov hFontBox, eax
+        invoke CreateFont, 16,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH or FF_DONTCARE,offset fontName
+        mov hFontSmall, eax
+
+        invoke CreateSolidBrush, 00FAF5F0h
+        mov hBgBrush, eax
+        invoke CreateSolidBrush, 00C88246h      ; blue   (normal)
+        mov hBr, eax
+        invoke CreateSolidBrush, 000096FFh      ; orange (comparing)
+        mov hBr+4, eax
+        invoke CreateSolidBrush, 0064AA3Ch      ; green  (sorted)
+        mov hBr+8, eax
+        invoke CreateSolidBrush, 003C3CDCh      ; red    (moving / key)
+        mov hBr+12, eax
+        invoke CreateSolidBrush, 00BE5A8Ch      ; purple (merged)
+        mov hBr+16, eax
+
+        invoke CreateWindowEx, WS_EX_CLIENTEDGE, offset editClass, offset defText, \
+               WS_CHILD or WS_VISIBLE or ES_AUTOHSCROLL, 10, 10, 250, 26, hWnd, ID_EDIT, hInstance, NULL
+        mov hEdit, eax
+        invoke SendMessage, eax, WM_SETFONT, hFontSmall, TRUE
+
+        invoke MakeBtn, offset sApply,  268, 60, ID_APPLY
+        invoke MakeBtn, offset sRandom, 332, 64, ID_RANDOM
+        invoke MakeBtn, offset sBubble, 410, 62, ID_BUBBLE
+        invoke MakeBtn, offset sHeap,   476, 54, ID_HEAP
+        invoke MakeBtn, offset sIns,    534, 76, ID_INS
+        invoke MakeBtn, offset sMerge,  614, 58, ID_MERGE
+        invoke MakeBtn, offset sSlow,   690, 62, ID_SLOW
+        invoke MakeBtn, offset sFast,   756, 62, ID_FAST
+
+        call SetSpeed
+        call ParseInput
+        mov nCount, eax
+        call NewArray
+        invoke SetTimer, hWnd, 1, 15, NULL
+        xor eax, eax
+        ret
+
+    .elseif uMsg==WM_COMMAND
+        mov eax, wParam
+        and eax, 0FFFFh
+        .if eax==ID_APPLY
+            call DoApply
+        .elseif eax==ID_RANDOM
+            call DoRandom
+        .elseif eax==ID_BUBBLE
+            invoke StartSort, 1
+        .elseif eax==ID_HEAP
+            invoke StartSort, 2
+        .elseif eax==ID_INS
+            invoke StartSort, 3
+        .elseif eax==ID_MERGE
+            invoke StartSort, 4
+        .elseif eax==ID_SLOW
+            .if speedLvl>1
+                dec speedLvl
+                call SetSpeed
+            .endif
+        .elseif eax==ID_FAST
+            .if speedLvl<6
+                inc speedLvl
+                call SetSpeed
+            .endif
+        .endif
+        xor eax, eax
+        ret
+
+    .elseif uMsg==WM_TIMER
+        call StepAnim
+        invoke InvalidateRect, hWnd, offset dirtyRc, FALSE
+        xor eax, eax
+        ret
+
+    .elseif uMsg==WM_ERASEBKGND
+        mov eax, 1
+        ret
+
+    .elseif uMsg==WM_PAINT
+        invoke BeginPaint, hWnd, addr ps
+        mov hdc, eax
+        invoke GetClientRect, hWnd, addr rc
+        invoke CreateCompatibleDC, hdc
+        mov memDC, eax
+        invoke CreateCompatibleBitmap, hdc, rc.right, rc.bottom
+        mov hbm, eax
+        invoke SelectObject, memDC, hbm
+        mov oldbm, eax
+        invoke FillRect, memDC, addr rc, hBgBrush
+        invoke DrawScene, memDC
+        invoke BitBlt, hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY
+        invoke SelectObject, memDC, oldbm
+        invoke DeleteObject, hbm
+        invoke DeleteDC, memDC
+        invoke EndPaint, hWnd, addr ps
+        xor eax, eax
+        ret
+
+    .elseif uMsg==WM_DESTROY
+        invoke KillTimer, hWnd, 1
+        invoke PostQuitMessage, 0
+        xor eax, eax
+        ret
+
+    .else
+        invoke DefWindowProc, hWnd, uMsg, wParam, lParam
+        ret
+    .endif
+    xor eax, eax
+    ret
+WndProc endp
+
+; ----------------------------------------------------------- UI helpers
+MakeBtn proc pText:DWORD, x:DWORD, w:DWORD, id:DWORD
+    invoke CreateWindowEx, 0, offset btnClass, pText, WS_CHILD or WS_VISIBLE or BS_PUSHBUTTON, \
+           x, 10, w, 26, hMain, id, hInstance, NULL
+    invoke SendMessage, eax, WM_SETFONT, hFontSmall, TRUE
+    ret
+MakeBtn endp
+
+SetSpeed proc uses eax edx
+    mov eax, speedLvl
+    shl eax, 2
+    mov stepPx, eax          ; 4..24 pixels per tick
+    mov eax, speedLvl
+    add eax, eax
+    mov edx, 14
+    sub edx, eax
+    mov delayTicks, edx      ; 12..2 idle ticks between steps
+    ret
+SetSpeed endp
+
+; Rand(range) -> eax in 0..range-1
+Rand proc range:DWORD
+    mov eax, seed
+    imul eax, eax, 1103515245
+    add eax, 12345
+    mov seed, eax
+    shr eax, 16
+    and eax, 7FFFh
+    xor edx, edx
+    div range
+    mov eax, edx
+    ret
+Rand endp
+
+; Reads numbers from the edit box into vals[]; returns how many (eax)
+ParseInput proc uses esi edi ebx
+    LOCAL cnt:DWORD
+    invoke GetWindowText, hEdit, offset inBuf, 255
+    mov esi, offset inBuf
+    mov cnt, 0
+pLoop:
+    movzx eax, byte ptr [esi]
+    cmp al, 0
+    je pEnd
+    cmp al, '-'
+    je pNum
+    cmp al, '0'
+    jb pSkip
+    cmp al, '9'
+    ja pSkip
+pNum:
+    xor ebx, ebx            ; sign
+    xor edx, edx            ; value
+    xor edi, edi            ; digits seen
+    cmp al, '-'
+    jne pDigit
+    mov ebx, 1
+    inc esi
+pDigit:
+    movzx eax, byte ptr [esi]
+    cmp al, '0'
+    jb pDone
+    cmp al, '9'
+    ja pDone
+    cmp edi, 4
+    jge pSkipDig
+    sub eax, '0'
+    imul edx, edx, 10
+    add edx, eax
+    inc edi
+pSkipDig:
+    inc esi
+    jmp pDigit
+pDone:
+    cmp edi, 0
+    je pLoop
+    cmp ebx, 0
+    je pPos
+    neg edx
+pPos:
+    cmp cnt, MAXN
+    jge pEnd
+    mov eax, cnt
+    mov vals[eax*4], edx
+    inc cnt
+    jmp pLoop
+pSkip:
+    inc esi
+    jmp pLoop
+pEnd:
+    mov eax, cnt
+    ret
+ParseInput endp
+
+; Writes vals[] back into the edit box as "a, b, c"
+FillEdit proc uses esi edi ebx
+    mov byte ptr inBuf, 0
+    xor ebx, ebx
+feLoop:
+    cmp ebx, nCount
+    jge feEnd
+    invoke wsprintf, offset numBuf, offset fmtNum, vals[ebx*4]
+    cmp ebx, 0
+    je feNum
+    invoke lstrcat, offset inBuf, offset sepStr
+feNum:
+    invoke lstrcat, offset inBuf, offset numBuf
+    inc ebx
+    jmp feLoop
+feEnd:
+    invoke SetWindowText, hEdit, offset inBuf
+    ret
+FillEdit endp
+
+DoApply proc
+    call ParseInput
+    cmp eax, 2
+    jl daBad
+    mov nCount, eax
+    call NewArray
+    ret
+daBad:
+    invoke MessageBox, hMain, offset msgBad, offset AppName, MB_OK or MB_ICONINFORMATION
+    ret
+DoApply endp
+
+DoRandom proc uses edi
+    invoke Rand, 7
+    add eax, 6
+    mov nCount, eax
+    xor edi, edi
+drLoop:
+    cmp edi, nCount
+    jge drEnd
+    invoke Rand, 99
+    inc eax
+    mov vals[edi*4], eax
+    inc edi
+    jmp drLoop
+drEnd:
+    call FillEdit
+    call NewArray
+    ret
+DoRandom endp
+
+; ------------------------------------------------- layout / snapshot helpers
+; Put box b into array slot 'slot' on level 'row'
+SetSlot proc uses eax ebx ecx edx b:DWORD, slot:DWORD, row:DWORD
+    mov ebx, slot
+    mov eax, ebx
+    imul eax, STEP
+    add eax, LEFTX
+    add eax, xoff[ebx*4]
+    mov ecx, b
+    mov tgX[ecx*4], eax
+    mov eax, row
+    imul eax, ROWH
+    add eax, BASEY
+    mov tgY[ecx*4], eax
+    ret
+SetSlot endp
+
+; Only set X of box b for 'slot'
+SetX proc uses eax ebx ecx b:DWORD, slot:DWORD
+    mov ebx, slot
+    mov eax, ebx
+    imul eax, STEP
+    add eax, LEFTX
+    add eax, xoff[ebx*4]
+    mov ecx, b
+    mov tgX[ecx*4], eax
+    ret
+SetX endp
+
+; Value of the box at array position pos -> eax
+ValAt proc pos:DWORD
+    mov eax, pos
+    mov eax, ordr[eax*4]
+    mov eax, vals[eax*4]
+    ret
+ValAt endp
+
+; All boxes blue, except positions >= fromPos which become green (sorted)
+ResetCols proc uses eax ecx edx fromPos:DWORD
+    xor ecx, ecx
+rcLoop:
+    cmp ecx, nCount
+    jge rcEnd
+    mov eax, ordr[ecx*4]
+    xor edx, edx
+    cmp ecx, fromPos
+    jl rcSet
+    mov edx, 2
+rcSet:
+    mov tgC[eax*4], edx
+    inc ecx
+    jmp rcLoop
+rcEnd:
+    ret
+ResetCols endp
+
+; Record current targets as a new animation step
+Snapshot proc uses eax ecx esi edi
+    mov eax, evCount
+    cmp eax, MAXEV
+    jge snEnd
+    imul eax, eax, RECSZ
+    mov edi, offset snaps
+    add edi, eax
+    mov esi, offset tgX
+    mov ecx, 36
+    cld
+    rep movsd
+    inc evCount
+snEnd:
+    ret
+Snapshot endp
+
+; Reset ordering/targets to the initial (unsorted) row and record step 0
+InitLayout proc uses eax ecx
+    xor ecx, ecx
+ilLoop:
+    cmp ecx, nCount
+    jge ilEnd
+    mov ordr[ecx*4], ecx
+    mov xoff[ecx*4], 0
+    mov tgC[ecx*4], 0
+    invoke SetSlot, ecx, ecx, 0
+    inc ecx
+    jmp ilLoop
+ilEnd:
+    mov evCount, 0
+    call Snapshot
+    ret
+InitLayout endp
+
+; New data: lay boxes out immediately (no animation)
+NewArray proc uses eax ecx esi edi
+    mov playing, 0
+    call InitLayout
+    cld
+    mov esi, offset tgX
+    mov edi, offset curX
+    mov ecx, 36
+    rep movsd
+    mov esi, offset tgX
+    mov edi, offset dtgX
+    mov ecx, 36
+    rep movsd
+    mov curTitle, offset tReady
+    mov curDesc, offset dReady
+    ret
+NewArray endp
+
+; Load snapshot evCur as the animation target
+LoadEvent proc uses eax ecx esi edi
+    mov eax, evCur
+    imul eax, eax, RECSZ
+    mov esi, offset snaps
+    add esi, eax
+    mov edi, offset dtgX
+    mov ecx, 36
+    cld
+    rep movsd
+    mov esi, offset dtgC
+    mov edi, offset curC
+    mov ecx, MAXN
+    rep movsd
+    mov eax, delayTicks
+    mov waitCnt, eax
+    ret
+LoadEvent endp
+
+; One timer tick of the animation engine
+StepAnim proc uses eax ebx ecx edx
+    LOCAL moved:DWORD
+    cmp playing, 0
+    je saEnd
+    mov moved, 0
+    xor ecx, ecx
+saLoop:
+    cmp ecx, nCount
+    jge saLoopEnd
+    MOVAXIS curX, dtgX
+    MOVAXIS curY, dtgY
+    inc ecx
+    jmp saLoop
+saLoopEnd:
+    cmp moved, 0
+    jne saEnd
+    cmp waitCnt, 0
+    jle saAdv
+    dec waitCnt
+    jmp saEnd
+saAdv:
+    inc evCur
+    mov eax, evCur
+    cmp eax, evCount
+    jl saLoad
+    mov playing, 0
+    jmp saEnd
+saLoad:
+    call LoadEvent
+saEnd:
+    ret
+StepAnim endp
+
+; ===================================================== drawing
+DrawScene proc uses ebx esi edi hdc:DWORD
+    LOCAL brc:RECT
+
+    invoke SetBkMode, hdc, TRANSPARENT
+
+    ; title + description + legend
+    invoke SelectObject, hdc, hFontTitle
+    invoke SetTextColor, hdc, 00403020h
+    invoke lstrlen, curTitle
+    invoke TextOut, hdc, 20, 52, curTitle, eax
+
+    invoke SelectObject, hdc, hFontSmall
+    invoke SetTextColor, hdc, 00505050h
+    invoke lstrlen, curDesc
+    invoke TextOut, hdc, 20, 90, curDesc, eax
+    invoke lstrlen, offset legendStr
+    invoke TextOut, hdc, 20, 116, offset legendStr, eax
+    invoke wsprintf, offset numBuf, offset fmtSpeed, speedLvl
+    invoke lstrlen, offset numBuf
+    invoke TextOut, hdc, 800, 58, offset numBuf, eax
+
+    ; boxes
+    invoke SelectObject, hdc, hFontBox
+    invoke SetTextColor, hdc, 00FFFFFFh
+    xor esi, esi
+dsLoop:
+    cmp esi, nCount
+    jge dsEnd
+    mov eax, curC[esi*4]
+    invoke SelectObject, hdc, hBr[eax*4]
+    mov eax, curX[esi*4]
+    mov brc.left, eax
+    add eax, BOXW
+    mov brc.right, eax
+    mov eax, curY[esi*4]
+    mov brc.top, eax
+    add eax, BOXH
+    mov brc.bottom, eax
+    invoke RoundRect, hdc, brc.left, brc.top, brc.right, brc.bottom, 14, 14
+    invoke wsprintf, offset numBuf, offset fmtNum, vals[esi*4]
+    invoke DrawText, hdc, offset numBuf, -1, addr brc, DT_CENTER or DT_VCENTER or DT_SINGLELINE
+    inc esi
+    jmp dsLoop
+dsEnd:
+    ret
+DrawScene endp
+
+; ===================================================== sorting algorithms
+; Swap array positions idxA/idxB with animation: lift, exchange, drop
+SwapAnim proc uses eax ecx edx idxA:DWORD, idxB:DWORD
+    mov eax, idxA
+    mov ecx, ordr[eax*4]
+    mov eax, idxB
+    mov edx, ordr[eax*4]
+    mov tgY[ecx*4], BASEY-LIFT
+    mov tgY[edx*4], BASEY+LIFT
+    mov tgC[ecx*4], 3
+    mov tgC[edx*4], 3
+    call Snapshot
+    mov eax, idxA
+    mov ordr[eax*4], edx
+    mov eax, idxB
+    mov ordr[eax*4], ecx
+    invoke SetX, edx, idxA
+    invoke SetX, ecx, idxB
+    call Snapshot
+    mov tgY[ecx*4], BASEY
+    mov tgY[edx*4], BASEY
+    call Snapshot
+    ret
+SwapAnim endp
+
+; ------------------------------------------------------------ Bubble sort
+BubbleRun proc
+    LOCAL i:DWORD, j:DWORD, a:DWORD
+    mov i, 0
+brOut:
+    mov eax, nCount
+    dec eax
+    cmp i, eax
+    jge brEnd
+    mov j, 0
+brIn:
+    mov eax, nCount
+    sub eax, i
+    dec eax
+    cmp j, eax
+    jge brInEnd
+    mov eax, nCount
+    sub eax, i
+    invoke ResetCols, eax
+    mov eax, j
+    mov ecx, ordr[eax*4]
+    mov tgC[ecx*4], 1
+    inc eax
+    mov ecx, ordr[eax*4]
+    mov tgC[ecx*4], 1
+    call Snapshot
+    invoke ValAt, j
+    mov a, eax
+    mov eax, j
+    inc eax
+    invoke ValAt, eax
+    cmp a, eax
+    jle brNoSwap
+    mov eax, j
+    inc eax
+    invoke SwapAnim, j, eax
+brNoSwap:
+    inc j
+    jmp brIn
+brInEnd:
+    inc i
+    jmp brOut
+brEnd:
+    ret
+BubbleRun endp
+
+; -------------------------------------------------------------- Heap sort
+SiftDown proc root:DWORD, sz:DWORD
+    LOCAL lc:DWORD, big:DWORD, rv:DWORD
+sdTop:
+    mov eax, root
+    shl eax, 1
+    inc eax
+    mov lc, eax
+    cmp eax, sz
+    jge sdRet
+    mov big, eax
+    inc eax                     ; right child
+    cmp eax, sz
+    jge sdCmp
+    invoke ValAt, eax
+    mov rv, eax
+    invoke ValAt, lc
+    cmp rv, eax
+    jle sdCmp
+    mov eax, lc
+    inc eax
+    mov big, eax
+sdCmp:
+    invoke ResetCols, sz
+    mov eax, root
+    mov ecx, ordr[eax*4]
+    mov tgC[ecx*4], 1
+    mov eax, big
+    mov ecx, ordr[eax*4]
+    mov tgC[ecx*4], 1
+    call Snapshot
+    invoke ValAt, root
+    mov rv, eax
+    invoke ValAt, big
+    cmp rv, eax
+    jge sdRet
+    invoke SwapAnim, root, big
+    mov eax, big
+    mov root, eax
+    jmp sdTop
+sdRet:
+    ret
+SiftDown endp
+
+HeapRun proc
+    LOCAL s:DWORD, e:DWORD
+    mov eax, nCount
+    shr eax, 1
+    dec eax
+    mov s, eax
+hrBuild:
+    cmp s, 0
+    jl hrBuildEnd
+    invoke SiftDown, s, nCount
+    dec s
+    jmp hrBuild
+hrBuildEnd:
+    mov eax, nCount
+    dec eax
+    mov e, eax
+hrExt:
+    cmp e, 1
+    jl hrEnd
+    invoke SwapAnim, 0, e
+    invoke SiftDown, 0, e
+    dec e
+    jmp hrExt
+hrEnd:
+    ret
+HeapRun endp
+
+; --------------------------------------------------------- Insertion sort
+InsRun proc
+    LOCAL i:DWORD, j:DWORD, key:DWORD, kv:DWORD
+    mov i, 1
+irOut:
+    mov eax, i
+    cmp eax, nCount
+    jge irEnd
+    mov ecx, ordr[eax*4]
+    mov key, ecx
+    mov eax, vals[ecx*4]
+    mov kv, eax
+    invoke ResetCols, nCount
+    mov ecx, key
+    mov tgC[ecx*4], 3
+    mov tgY[ecx*4], BASEY-LIFT
+    call Snapshot
+    mov eax, i
+    dec eax
+    mov j, eax
+irIn:
+    cmp j, 0
+    jl irPlace
+    invoke ValAt, j
+    cmp eax, kv
+    jle irPlace
+    mov eax, j                  ; shift box j one slot right
+    mov ecx, ordr[eax*4]
+    mov tgC[ecx*4], 1
+    inc eax
+    mov ordr[eax*4], ecx
+    invoke SetX, ecx, eax
+    call Snapshot
+    dec j
+    jmp irIn
+irPlace:
+    mov eax, j
+    inc eax
+    mov ecx, key
+    mov ordr[eax*4], ecx
+    invoke SetX, ecx, eax
+    mov ecx, key
+    mov tgY[ecx*4], BASEY
+    invoke ResetCols, nCount
+    call Snapshot
+    inc i
+    jmp irOut
+irEnd:
+    ret
+InsRun endp
+
+; ------------------------------------------------------------- Merge sort
+; Put box b into slot on level 'depth' (green if the final level, else purple)
+PlaceMerged proc uses eax ecx b:DWORD, slot:DWORD, depth:DWORD
+    invoke SetSlot, b, slot, depth
+    mov ecx, b
+    mov eax, 4
+    cmp depth, 0
+    jne pmSet
+    mov eax, 2
+pmSet:
+    mov tgC[ecx*4], eax
+    call Snapshot
+    ret
+PlaceMerged endp
+
+MSort proc lo:DWORD, hi:DWORD, depth:DWORD
+    LOCAL mid:DWORD, p:DWORD, i:DWORD, j:DWORD, k:DWORD
+    LOCAL bA:DWORD, bB:DWORD, cA:DWORD, cB:DWORD, nd:DWORD
+
+    mov eax, lo
+    cmp eax, hi
+    jge msDone
+    add eax, hi
+    shr eax, 1
+    mov mid, eax
+    mov eax, depth
+    inc eax
+    mov nd, eax
+
+    ; ---- divide: left half moves left, right half right, both go one level down
+    mov eax, lo
+    mov p, eax
+divLoop:
+    mov eax, p
+    cmp eax, hi
+    jg divEnd
+    cmp eax, mid
+    jg divRight
+    sub xoff[eax*4], DIVX
+    jmp divMove
+divRight:
+    add xoff[eax*4], DIVX
+divMove:
+    mov eax, p
+    mov ecx, ordr[eax*4]
+    invoke SetSlot, ecx, p, nd
+    inc p
+    jmp divLoop
+divEnd:
+    call Snapshot
+
+    ; ---- recurse on both halves
+    invoke MSort, lo, mid, nd
+    mov eax, mid
+    inc eax
+    invoke MSort, eax, hi, nd
+
+    ; ---- undo the split offsets
+    mov eax, lo
+    mov p, eax
+undoLoop:
+    mov eax, p
+    cmp eax, hi
+    jg undoEnd
+    cmp eax, mid
+    jg undoRight
+    add xoff[eax*4], DIVX
+    jmp undoNext
+undoRight:
+    sub xoff[eax*4], DIVX
+undoNext:
+    inc p
+    jmp undoLoop
+undoEnd:
+
+    ; ---- copy segment to tmpA
+    mov eax, lo
+    mov p, eax
+cpLoop:
+    mov eax, p
+    cmp eax, hi
+    jg cpEnd
+    mov ecx, ordr[eax*4]
+    mov tmpA[eax*4], ecx
+    inc p
+    jmp cpLoop
+cpEnd:
+    mov eax, lo
+    mov i, eax
+    mov k, eax
+    mov eax, mid
+    inc eax
+    mov j, eax
+
+    ; ---- merge
+mgLoop:
+    mov eax, i
+    cmp eax, mid
+    jg mgRightRest
+    mov eax, j
+    cmp eax, hi
+    jg mgLeftRest
+
+    mov eax, i
+    mov ecx, tmpA[eax*4]
+    mov bA, ecx
+    mov eax, j
+    mov edx, tmpA[eax*4]
+    mov bB, edx
+    mov eax, tgC[ecx*4]
+    mov cA, eax
+    mov eax, tgC[edx*4]
+    mov cB, eax
+    mov tgC[ecx*4], 1
+    mov tgC[edx*4], 1
+    call Snapshot
+
+    mov ecx, bA
+    mov edx, bB
+    mov eax, vals[ecx*4]
+    cmp eax, vals[edx*4]
+    jg takeRight
+    ; take left box
+    mov eax, cB
+    mov tgC[edx*4], eax
+    mov eax, k
+    mov ordr[eax*4], ecx
+    invoke PlaceMerged, ecx, k, depth
+    inc i
+    inc k
+    jmp mgLoop
+takeRight:
+    mov eax, cA
+    mov tgC[ecx*4], eax
+    mov eax, k
+    mov ordr[eax*4], edx
+    invoke PlaceMerged, edx, k, depth
+    inc j
+    inc k
+    jmp mgLoop
+
+mgLeftRest:
+    mov eax, i
+    mov ecx, tmpA[eax*4]
+    mov eax, k
+    mov ordr[eax*4], ecx
+    invoke PlaceMerged, ecx, k, depth
+    inc i
+    inc k
+    jmp mgLoop
+
+mgRightRest:
+    mov eax, j
+    cmp eax, hi
+    jg msDone
+    mov ecx, tmpA[eax*4]
+    mov eax, k
+    mov ordr[eax*4], ecx
+    invoke PlaceMerged, ecx, k, depth
+    inc j
+    inc k
+    jmp mgLoop
+
+msDone:
+    ret
+MSort endp
+
+; ------------------------------------------------ run an algorithm + play it
+StartSort proc algo:DWORD
+    cmp playing, 0
+    jne ssEnd
+    call InitLayout
+    mov eax, algo
+    cmp eax, 1
+    je ssBub
+    cmp eax, 2
+    je ssHeap
+    cmp eax, 3
+    je ssIns
+    mov curTitle, offset tMergeT
+    mov curDesc, offset dMergeT
+    mov eax, nCount
+    dec eax
+    invoke MSort, 0, eax, 0
+    jmp ssDone
+ssBub:
+    mov curTitle, offset tBubbleT
+    mov curDesc, offset dBubbleT
+    call BubbleRun
+    jmp ssDone
+ssHeap:
+    mov curTitle, offset tHeapT
+    mov curDesc, offset dHeapT
+    call HeapRun
+    jmp ssDone
+ssIns:
+    mov curTitle, offset tInsT
+    mov curDesc, offset dInsT
+    call InsRun
+ssDone:
+    invoke ResetCols, 0          ; everything green
+    call Snapshot
+    mov evCur, 0
+    call LoadEvent
+    mov playing, 1
+ssEnd:
+    ret
+StartSort endp
+
+end start
